@@ -43,29 +43,51 @@ async function getJSON(url, name) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
+/* Streaming keeps slow answers from hitting Safari's request timeout. */
+async function readStream(r) {
+  let buf = '', text = '';
+  const take = line => {
+    if (!line.startsWith('data:')) return;
+    try { text += (JSON.parse(line.slice(5).trim()).candidates?.[0]?.content?.parts || []).map(p => p.text || '').join(''); } catch {}
+  };
+  if (!r.body?.getReader) { (await r.text()).split(/\r?\n/).forEach(take); return text; }
+  const rd = r.body.getReader(), dec = new TextDecoder();
+  for (;;) {
+    const {done, value} = await rd.read();
+    if (done) break;
+    buf += dec.decode(value, {stream: true});
+    const lines = buf.split(/\r?\n/); buf = lines.pop();
+    lines.forEach(take);
+  }
+  take(buf);
+  return text;
+}
 async function gemini(prompt, json = true) {
   let last;
   for (const model of MODELS) {
     for (let attempt = 0; attempt < 3; attempt++) {
-      let r;
+      let r, text;
       try {
-        r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json', 'x-goog-api-key': keys().gemini},
           body: JSON.stringify({contents: [{parts: [{text: prompt}]}], generationConfig: {temperature: .2, ...(json ? {responseMimeType: 'application/json'} : {})}})
         });
-      } catch { throw new ApiError('连不上 Gemini。检查网络后再试。'); }
+        if (r.ok) text = await readStream(r);
+      } catch (e) {
+        last = new ApiError(`连不上 Gemini（${e.name}：${e.message}）。请让 App 停留在前台再试。`);
+        await sleep(1500);
+        continue;
+      }
       if (r.ok) {
-        const data = await r.json();
-        const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
         if (!text) { last = new ApiError('Gemini 没有返回内容。'); break; }
         if (!json) return text.trim();
-        try { return JSON.parse(text.replace(/^```(?:json)?|```$/g, '').trim()); }
+        try { return JSON.parse(text.replace(/^\s*```(?:json)?|```\s*$/g, '').trim()); }
         catch { last = new ApiError('Gemini 返回的格式不对，再试一次。'); continue; }
       }
       if (r.status === 400 || r.status === 401 || r.status === 403) {
         const body = await r.text();
-        if (r.status === 400 && !/api.?key/i.test(body)) { last = new ApiError('Gemini 拒绝了这次请求。'); break; }
+        if (r.status === 400 && !/api.?key/i.test(body)) { last = new ApiError(`Gemini 拒绝了这次请求（${r.status}）。`); break; }
         throw new ApiError('Gemini 的 key 不对。到设置里检查一下。', r.status);
       }
       last = new ApiError(r.status === 429 ? 'Gemini 请求太频繁或今天额度用完了。' : `Gemini 返回错误（${r.status}）。`, r.status);
@@ -155,7 +177,7 @@ async function showBrief(force) {
   if (!keys().guardian || !keys().gemini) return showSettings(true);
   let b = force ? null : await idb.get(`brief:${today()}`);
   if (!b) {
-    view.innerHTML = mastHTML(null) + '<p class="loading">正在抓取并翻译，第一次打开要等大约半分钟。</p>';
+    view.innerHTML = mastHTML(null) + '<p class="loading">正在抓取并翻译，第一次打开要等大约一分钟，请停留在这个页面。</p>';
     try { b = await buildBrief(); }
     catch (e) {
       const old = await latestBrief();
@@ -482,5 +504,6 @@ function setTab(t) { document.querySelectorAll('#tabs button').forEach(b => b.cl
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => ({brief: () => showBrief(), live: showLive, words: showWords, settings: () => showSettings()})[b.dataset.tab]());
 window.addEventListener('popstate', () => { closeSheet(); document.body.classList.remove('reading'); if (lastView === 'live') { const y = ls.get('liveScroll', 0); renderLive('返回列表。'); window.scrollTo(0, y); } else if (current) renderBrief(current); else showBrief(); });
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+document.addEventListener('visibilitychange', () => { if (!document.hidden) $('#retry')?.click(); });
 applyTheme();
 showBrief();
