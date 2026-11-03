@@ -276,13 +276,14 @@ async function showArticle(id) {
   view.innerHTML = `<button class="back" id="back">‹ 返回</button>
     <h1 class="art-zh-title">${esc(a.zhTitle || a.title)}</h1>
     <h2 class="art-en-title">${wrapWords(a.title)}</h2>
-    <p class="art-meta">${esc(a.source)}${a.byline ? '，' + esc(a.byline) : ''}</p><div id="body"></div><div id="comments"></div>`;
+    <p class="art-meta">${esc(a.source)}${a.byline ? '，' + esc(a.byline) : ''}</p><div id="body"></div><div id="related"></div><div id="comments"></div>`;
   $('#back').onclick = () => history.back();
   if (a.full) return loadFull(a);
   $('#body').innerHTML = `${a.abstract ? `<div class="pair"><p class="zh wait" data-s="1">翻译中</p><p class="en">${wrapWords(a.abstract)}</p></div>` : ''}
-    <div class="paywall"><p class="note">${esc(a.source)}只提供标题和摘要，全文要到原网站看，部分媒体需要订阅。</p>
+    <div class="paywall"><p class="note">${esc(a.source)}在这里只有标题或摘要。全文要到原网站看，部分媒体需要订阅。</p>
     <div class="row"><a class="btn solid" href="${esc(a.url)}" target="_blank" rel="noopener">打开原文</a></div></div>`;
   $('#comments').innerHTML = '<h2 class="c-title">读者评论</h2><p class="note">这家媒体的评论只能到原文页面查看。</p>';
+  loadRelated(a);
   const sEl = view.querySelector('[data-s]');
   if (sEl) { const set = t => { sEl.textContent = t; sEl.classList.remove('wait'); }; if (a.zhSummary) set(a.zhSummary); else translate(a.abstract).then(set).catch(() => set('')); }
 }
@@ -330,6 +331,27 @@ async function translateRest(a, art, key, body) {
     body.prepend(box);
     box.querySelector('button').onclick = () => { box.remove(); view.querySelectorAll('.zh.wait').forEach(el => el.textContent = '翻译中'); translateRest(a, art, key, body); };
   }
+}
+
+/* ---------- same event, readable in full ---------- */
+const STOP = new Set('the a an of to in on for and or as at by with from is are was were be been his her their its it this that after over into amid says said say new will has have had not but about who what why how more than up out'.split(' '));
+async function loadRelated(a) {
+  const box = $('#related');
+  if (!box) return;
+  const words = a.title.replace(/[^A-Za-z0-9' -]/g, ' ').split(/\s+/).filter(w => w.length > 2 && !STOP.has(w.toLowerCase())).slice(0, 5);
+  if (words.length < 2) return;
+  const from = new Date(Date.now() - 4 * 864e5).toISOString().slice(0, 10);
+  const u = new URLSearchParams({'api-key': keys().guardian, q: words.join(' OR '), 'query-fields': 'headline', type: 'article', 'from-date': from, 'order-by': 'relevance', 'page-size': '10', 'show-fields': 'headline,trailText,byline,wordcount,shortUrl'});
+  let list;
+  try { list = (await getJSON(`https://content.guardianapis.com/search?${u}`, '卫报')).response?.results || []; } catch { return; }
+  const score = t => { const h = t.toLowerCase(); return words.filter(w => h.includes(w.toLowerCase())).length; };
+  const hits = list.map(mapGuardian).map(x => ({x, n: score(x.title)})).filter(o => o.n >= Math.min(3, Math.ceil(words.length * .6))).sort((p, q) => q.n - p.n).slice(0, 3).map(o => o.x);
+  if (!hits.length || !box.isConnected) return;
+  await mapLimit(hits, 3, async h => { h.id = 'rel-' + h.url; h.zhTitle = await translate(h.title).catch(() => h.title); registry.set(h.id, h); });
+  if (!box.isConnected) return;
+  box.innerHTML = `<h2 class="c-title">可能相关的全文报道</h2><p class="note">由关键词匹配，来自卫报，不一定是同一件事。</p>` +
+    hits.map(h => `<button class="item" data-id="${esc(h.id)}"><h3>${esc(h.zhTitle)}</h3><div class="src">The Guardian，可读全文</div></button>`).join('');
+  box.querySelectorAll('.item').forEach(el => el.onclick = () => showArticle(el.dataset.id));
 }
 
 /* ---------- comments ---------- */
@@ -517,6 +539,7 @@ function showWords() {
 
 /* ---------- themes ---------- */
 const THEMES = [['粉色', '#EC6A9C'], ['紫色', '#9B72CF'], ['蓝色', '#4F86C6'], ['绿色', '#4FA37A'], ['橙色', '#E58A3C']];
+function applySize() { view.style.zoom = ls.get('size', 1); }
 function applyTheme() {
   const t = ls.get('theme', {accent: '#EC6A9C', night: false});
   const r = document.documentElement;
@@ -529,13 +552,15 @@ function themeHTML() {
   const t = ls.get('theme', {accent: '#EC6A9C', night: false});
   return `<h2 class="c-title">主题色</h2><div class="swatches">${THEMES.map(([n, c]) => `<button class="sw${t.accent.toLowerCase() === c.toLowerCase() ? ' on' : ''}" data-c="${c}" style="background:${c}" aria-label="${n}"></button>`).join('')}
     <label class="custom">自选<input type="color" id="t-custom" value="${esc(t.accent)}"></label></div>
-    <label class="night"><input type="checkbox" id="t-night"${t.night ? ' checked' : ''}> 夜间模式</label>`;
+    <label class="night"><input type="checkbox" id="t-night"${t.night ? ' checked' : ''}> 夜间模式</label>
+    <h2 class="c-title">字号</h2><div class="chips sizes">${[['标准', 1], ['大', 1.12], ['特大', 1.25]].map(([n, v]) => `<button class="chip${ls.get('size', 1) === v ? ' on' : ''}" data-size="${v}">${n}</button>`).join('')}</div>`;
 }
 function bindTheme() {
   const set = patch => { ls.set('theme', {...ls.get('theme', {accent: '#EC6A9C', night: false}), ...patch}); applyTheme(); };
   view.querySelectorAll('.sw').forEach(b => b.onclick = () => { set({accent: b.dataset.c}); view.querySelectorAll('.sw').forEach(x => x.classList.toggle('on', x === b)); });
   $('#t-custom').oninput = e => { set({accent: e.target.value}); view.querySelectorAll('.sw').forEach(x => x.classList.remove('on')); };
   $('#t-night').onchange = e => set({night: e.target.checked});
+  view.querySelectorAll('[data-size]').forEach(b => b.onclick = () => { ls.set('size', +b.dataset.size); applySize(); view.querySelectorAll('[data-size]').forEach(x => x.classList.toggle('on', x === b)); });
 }
 
 /* ---------- settings ---------- */
@@ -566,4 +591,5 @@ window.addEventListener('popstate', () => { closeSheet(); document.body.classLis
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 document.addEventListener('visibilitychange', () => { if (!document.hidden) $('#retry')?.click(); });
 applyTheme();
+applySize();
 showBrief();
