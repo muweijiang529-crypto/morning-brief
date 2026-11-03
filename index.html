@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>晨读</title>
+<meta name="theme-color" content="#FDEEF4">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="晨读">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="apple-touch-icon" href="icons/180.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="fonts.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="view"></main>
+<nav id="tabs" aria-label="主导航">
+  <button data-tab="brief">早报</button>
+  <button data-tab="live">实时</button>
+  <button data-tab="words">生词本</button>
+  <button data-tab="settings">设置</button>
+</nav>
+<div id="sheet-back" hidden></div>
+<section id="sheet" role="dialog" aria-label="查词" hidden></section>
+<button id="sel-btn" hidden>翻译选中的内容</button>
+<script src="app.js"></script>
+</body>
+</html>
