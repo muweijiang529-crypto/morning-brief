@@ -1,16 +1,16 @@
 :root{
   --accent:#EC6A9C;
   --sky:color-mix(in srgb,var(--accent) 11%,#fff); --surface:color-mix(in srgb,var(--accent) 4%,#fff);
-  --ink:color-mix(in srgb,var(--accent) 16%,#1a1216); --muted:color-mix(in srgb,var(--accent) 22%,#574d52);
-  --line:color-mix(in srgb,var(--accent) 28%,#fff); --en:color-mix(in srgb,var(--accent) 62%,#000);
+  --ink:color-mix(in srgb,var(--accent) 6%,#17121a); --muted:color-mix(in srgb,var(--accent) 10%,#463f45);
+  --line:color-mix(in srgb,var(--accent) 28%,#fff); --en:color-mix(in srgb,var(--accent) 22%,#20202c);
   --sun:var(--accent); --err:#A32A2A;
   --zh:Palatino,"Palatino Linotype","Book Antiqua","TeX Gyre Pagella","Zhuque Fangsong",FangSong,STFangsong,serif;
   --latin:Palatino,"Palatino Linotype","Book Antiqua","TeX Gyre Pagella",Georgia,serif;
 }
 :root[data-night]{
   --sky:color-mix(in srgb,var(--accent) 10%,#14101a); --surface:color-mix(in srgb,var(--accent) 16%,#14101a);
-  --ink:#F2ECEF; --muted:color-mix(in srgb,var(--accent) 22%,#b5abb0); --line:color-mix(in srgb,var(--accent) 28%,#2a2430);
-  --en:color-mix(in srgb,var(--accent) 45%,#fff); --err:#F09A9A;
+  --ink:#F2ECEF; --muted:color-mix(in srgb,var(--accent) 10%,#c7c0c5); --line:color-mix(in srgb,var(--accent) 28%,#2a2430);
+  --en:color-mix(in srgb,var(--accent) 22%,#fff); --err:#F09A9A;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{-webkit-text-size-adjust:100%}
@@ -85,7 +85,7 @@ body.reading #tabs{display:none}
 .word-row button{float:right;background:none;border:0;color:var(--muted);font-size:14px}
 label{display:block;font-weight:600;margin-top:20px}
 label small{display:block;font-weight:400;color:var(--muted);font-size:14px;line-height:1.5}
-label a{color:var(--en)}
+label a{color:var(--ink)}
 input[type=text]{width:100%;margin-top:7px;padding:11px 12px;border:1px solid var(--line);border-radius:9px;background:var(--surface);font-size:16px}
 .c-title{font-size:20px;font-weight:700;margin:30px 0 8px}
 .comment{padding:14px 0;border-bottom:1px solid var(--line)}
@@ -98,4 +98,7 @@ input[type=text]{width:100%;margin-top:7px;padding:11px 12px;border:1px solid va
 .custom input{width:38px;height:38px;padding:0;border:0;background:none}
 .night{font-weight:400;margin-top:12px;display:flex;gap:8px;align-items:center}
 .live-note{margin-bottom:4px}
+.chips{display:flex;gap:8px;overflow-x:auto;margin:12px -18px 4px;padding:2px 18px;scrollbar-width:none}
+.chip{flex:none;border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:5px 13px;font-size:15px;color:var(--ink)}
+.chip.on{background:var(--ink);color:var(--sky);border-color:var(--ink)}
 [hidden]{display:none!important}

@@ -98,7 +98,45 @@ async function gemini(prompt, json = true) {
   throw last;
 }
 
+/* Quick translation: no key and no AI quota. AI is kept for choosing stories and explaining words. */
+async function gtOne(t) {
+  const r = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=${encodeURIComponent(t)}`);
+  if (!r.ok) throw new ApiError(`翻译服务返回错误（${r.status}）。`);
+  return (await r.json())[0].map(x => x[0]).join('');
+}
+async function translate(text) {
+  const parts = [];
+  let rest = text.trim();
+  while (rest.length > 1500) {
+    let cut = rest.lastIndexOf('. ', 1500);
+    if (cut < 300) cut = 1500;
+    parts.push(rest.slice(0, cut + 1)); rest = rest.slice(cut + 1).trim();
+  }
+  if (rest) parts.push(rest);
+  const out = [];
+  for (const p of parts) {
+    try { out.push(await gtOne(p)); }
+    catch { out.push(await gemini(`把这段英文新闻翻译成简体中文，只输出译文：\n${p}`, false)); }
+  }
+  return out.join('');
+}
+async function mapLimit(list, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({length: Math.min(n, list.length)}, async () => {
+    while (i < list.length) { const k = i++; await fn(list[k], k); }
+  }));
+}
+
 /* ---------- sources ---------- */
+const GUARDIAN_TOPIC = {'US news': '美国政治', 'World news': '国际', Business: '经济与科技', Technology: '经济与科技', Environment: '气候与环境'};
+const topicOf = a => a.topic || GUARDIAN_TOPIC[a.section] || (/politic|^us$|u\.s\./i.test(a.section || '') ? '美国政治' : /world/i.test(a.section || '') ? '国际' : /business|tech|econom/i.test(a.section || '') ? '经济与科技' : /climate|environment|science/i.test(a.section || '') ? '气候与环境' : /art|film|movie|music|book|culture|tv|sport|style/i.test(a.section || '') ? '文化娱乐' : '国际');
+async function fetchFeeds() {
+  try {
+    const r = await fetch(`feeds.json?t=${Math.floor(Date.now() / 3e5)}`);
+    if (!r.ok) return [];
+    return ((await r.json()).items || []).map(a => ({...a, full: !!a.paras}));
+  } catch { return []; }
+}
 const SECTIONS = 'us-news|world|business|environment|technology|film|tv-and-radio|music|culture|books|sport';
 async function fetchGuardian() {
   const from = new Date(Date.now() - 36 * 3600e3).toISOString().slice(0, 10);
@@ -114,41 +152,54 @@ async function fetchNYT() {
     for (const a of d.results || []) {
       if (!a.title || !a.url || !a.abstract) continue;
       if (Date.now() - new Date(a.published_date) > 48 * 3600e3) continue;
-      out.push({source: 'New York Times', full: false, url: a.url, section: a.section, title: a.title, abstract: a.abstract, byline: a.byline || '', date: a.published_date});
+      out.push({source: 'New York Times', side: 'us', full: false, url: a.url, section: a.section, title: a.title, abstract: a.abstract, byline: a.byline || '', date: a.published_date});
     }
   }
   const seen = new Set();
   return out.filter(a => !seen.has(a.url) && seen.add(a.url)).slice(0, 40);
 }
 function mapGuardian(a) {
-  return {source: 'The Guardian', full: true, gid: a.id, url: a.webUrl, section: a.sectionName, shortUrl: a.fields?.shortUrl || '',
+  return {source: 'The Guardian', side: 'intl', full: true, gid: a.id, url: a.webUrl, section: a.sectionName, shortUrl: a.fields?.shortUrl || '',
     title: a.fields?.headline || a.webTitle, abstract: stripTags(a.fields?.trailText), byline: a.fields?.byline || '', date: a.webPublicationDate};
 }
 function stripTags(h) { return new DOMParser().parseFromString(h || '', 'text/html').body.textContent.trim(); }
 
 const TOPICS = ['美国政治', '国际', '经济与科技', '气候与环境', '文化娱乐'];
 async function buildBrief() {
-  const results = await Promise.allSettled([fetchGuardian(), fetchNYT()]);
+  const results = await Promise.allSettled([fetchGuardian(), fetchNYT(), fetchFeeds()]);
   const cands = results.flatMap(r => r.status === 'fulfilled' ? r.value : []);
   const failed = results.filter(r => r.status === 'rejected').map(r => r.reason.message);
   if (!cands.length) throw new ApiError(failed[0] || '过去一天没有抓到新闻。');
-  const list = cands.map((a, i) => ({i, source: a.source, section: a.section, title: a.title, abstract: (a.abstract || '').slice(0, 220)}));
-  const res = await gemini(`你是一位给中文读者编早报的资深编辑。读者住在美国，想跟上美国和国际新闻，并融入美国社会，也关心娱乐文化。
-从下面的候选新闻中选出最重要的 15 条，合起来 5–10 分钟读完。要求：
-- 重要的事件优先，不选小众或琐碎内容；同一事件只留一条，优先留 source 为 The Guardian 的（有全文）。
+  const perSource = {};
+  const pool = cands.filter(a => (perSource[a.source] = (perSource[a.source] || 0) + 1) <= 12);
+  const list = pool.map((a, i) => ({i, source: a.source, topic: topicOf(a), title: a.title, abstract: (a.abstract || '').slice(0, 160)}));
+  let items;
+  try {
+    const res = await gemini(`你是一位给中文读者编早报的资深编辑。读者住在美国，想跟上美国和国际新闻，并融入美国社会，也关心娱乐文化。
+从下面的候选新闻中选出最重要的 18 条，合起来 5–10 分钟读完。要求：
+- 重要的事件优先，不选小众或琐碎内容；同一事件只留一条。
+- 来源尽量多样，不要集中在一两家媒体；同一来源不超过 4 条。
 - topic 只能从这些里选：${TOPICS.join('、')}。文化娱乐选 2–3 条，美国政治和国际占大头。
-- zh_title：准确、不夸张的中文标题，不超过 28 个字。
-- zh_summary：两句话的中文摘要，先说发生了什么，再说为什么重要或背景；对中国读者不熟悉的美国人名、机构要顺带说明。只使用候选内容里有的事实，不要补充，不要加入自己的立场。
+- zh_title：准确、不夸张的中文标题，不超过 24 个字。
+- zh_summary：凝练的中文摘要，不超过 60 个字，说清发生了什么和为什么重要；陌生的美国人名、机构顺带说明。只使用候选内容里有的事实，没有摘要的只概括标题，不要补充，不要加入自己的立场。
 - 按重要性排序，第一条是今天最重要的新闻。
 只输出 JSON：{"items":[{"i":候选序号,"topic":"","zh_title":"","zh_summary":""}]}
 
 候选：
 ${JSON.stringify(list)}`);
-  const items = (res.items || []).filter(x => cands[x.i]).map(x => ({...cands[x.i], topic: TOPICS.includes(x.topic) ? x.topic : '国际', zhTitle: x.zh_title, zhSummary: x.zh_summary}));
-  if (!items.length) throw new ApiError('Gemini 没有选出新闻，再试一次。');
+    items = (res.items || []).filter(x => pool[x.i]).map(x => ({...pool[x.i], topic: TOPICS.includes(x.topic) ? x.topic : topicOf(pool[x.i]), zhTitle: x.zh_title, zhSummary: x.zh_summary}));
+    if (!items.length) throw new ApiError('Gemini 没有选出新闻。');
+  } catch (e) {
+    /* AI unavailable: still give a translated brief, chosen by simple rotation across sources. */
+    const seen = {}, picked = [];
+    for (const a of pool) { const k = a.source + topicOf(a); if (!seen[k] && picked.length < 18) { seen[k] = 1; picked.push(a); } }
+    items = picked.map(a => ({...a, topic: topicOf(a)}));
+    await mapLimit(items, 4, async a => { a.zhTitle = await translate(a.title).catch(() => a.title); a.zhSummary = a.abstract ? await translate(a.abstract).catch(() => a.abstract) : ''; });
+    failed.push('AI 选稿暂时不可用，这期按来源轮流选取。');
+  }
   items.forEach((a, n) => a.id = `${today()}-${n}`);
   const brief = {date: today(), items, warning: failed[0] || '', read: []};
-  await idb.set(`brief:${today()}`, brief);
+  await idb.set(`b2:${today()}`, brief);
   prune();
   return brief;
 }
@@ -166,7 +217,7 @@ const registry = new Map();
 const WEEK = '日一二三四五六';
 function mastHTML(b) {
   const d = new Date(), read = b ? b.read.length : 0, total = b ? b.items.length : 0, pct = total ? read / total * 100 : 0;
-  const mins = total ? Math.max(1, Math.round(b.items.slice(read ? 0 : 0).reduce((s, a) => s + a.zhSummary.length + a.zhTitle.length, 0) / 350)) : 0;
+  const mins = total ? Math.max(1, Math.round(b.items.slice(read ? 0 : 0).reduce((s, a) => s + (a.zhSummary || '').length + a.zhTitle.length, 0) / 350)) : 0;
   return `<header class="mast"><h1 class="date">${d.getMonth()+1}月${d.getDate()}日，周${WEEK[d.getDay()]}</h1>
     <p class="sub">${total ? `昨天以来的 ${total} 条新闻，摘要约 ${mins} 分钟读完。已读 ${read} 条。` : '正在整理昨天以来的新闻。'}</p>
     <div class="horizon" aria-hidden="true"><div class="fill" style="width:${pct}%"></div><div class="sun" style="left:calc(14px + (100% - 28px) * ${pct / 100})"></div></div></header>`;
@@ -175,7 +226,7 @@ async function showBrief(force) {
   setTab('brief'); lastView = 'brief';
   document.body.classList.remove('reading');
   if (!keys().guardian || !keys().gemini) return showSettings(true);
-  let b = force ? null : await idb.get(`brief:${today()}`);
+  let b = force ? null : await idb.get(`b2:${today()}`);
   if (!b) {
     view.innerHTML = mastHTML(null) + '<p class="loading">正在抓取并翻译，第一次打开要等大约一分钟，请停留在这个页面。</p>';
     try { b = await buildBrief(); }
@@ -191,19 +242,19 @@ async function showBrief(force) {
   renderBrief(b);
 }
 async function latestBrief() {
-  const ks = (await idb.keys()).filter(k => String(k).startsWith('brief:')).sort();
+  const ks = (await idb.keys()).filter(k => String(k).startsWith('b2:')).sort();
   return ks.length ? idb.get(ks[ks.length - 1]) : null;
 }
 function renderBrief(b) {
   current = b; lastView = 'brief';
   b.items.forEach(a => registry.set(a.id, a));
   let html = mastHTML(b), lastTopic = null, first = true;
-  if (b.warning) html += `<p class="note">${esc(b.warning)} 这期只用了能连上的来源。</p>`;
+  if (b.warning) html += `<p class="note">${esc(b.warning)}</p>`;
   const ordered = [];
   for (const t of TOPICS) b.items.filter(a => a.topic === t).forEach(a => ordered.push(a));
   for (const a of ordered) {
     if (a.topic !== lastTopic) { html += `<h2 class="topic">${esc(a.topic)}</h2>`; lastTopic = a.topic; }
-    html += `<button class="item${first ? ' lead' : ''}${b.read.includes(a.id) ? ' read' : ''}" data-id="${esc(a.id)}"><h3>${esc(a.zhTitle)}</h3><p>${esc(a.zhSummary)}</p><div class="src">${esc(a.source)}${a.full ? '' : '，摘要'}</div></button>`;
+    html += `<button class="item${first ? ' lead' : ''}${b.read.includes(a.id) ? ' read' : ''}" data-id="${esc(a.id)}"><h3>${esc(a.zhTitle)}</h3>${a.zhSummary ? `<p>${esc(a.zhSummary)}</p>` : ''}<div class="src">${esc(a.source)}${a.full ? '' : '，打开可看原文'}</div></button>`;
     first = false;
   }
   html += `<div class="row"><button class="btn" id="refresh">重新抓取今天的新闻</button></div>`;
@@ -220,7 +271,7 @@ async function showArticle(id) {
   ls.set(lastView === 'live' ? 'liveScroll' : 'briefScroll', window.scrollY);
   document.body.classList.add('reading');
   history.pushState({article: id}, '');
-  if (current && current.items.some(x => x.id === id) && !current.read.includes(id)) { current.read.push(id); idb.set(`brief:${current.date}`, current); }
+  if (current && current.items.some(x => x.id === id) && !current.read.includes(id)) { current.read.push(id); idb.set(`b2:${current.date}`, current); }
   window.scrollTo(0, 0);
   view.innerHTML = `<button class="back" id="back">‹ 返回</button>
     <h1 class="art-zh-title">${esc(a.zhTitle || a.title)}</h1>
@@ -228,14 +279,17 @@ async function showArticle(id) {
     <p class="art-meta">${esc(a.source)}${a.byline ? '，' + esc(a.byline) : ''}</p><div id="body"></div><div id="comments"></div>`;
   $('#back').onclick = () => history.back();
   if (a.full) return loadFull(a);
-  $('#body').innerHTML = `<div class="pair"><p class="zh">${esc(a.zhSummary || '')}</p><p class="en">${wrapWords(a.abstract)}</p></div>
-    <div class="paywall"><p class="note">《纽约时报》的接口只提供摘要。用图书馆证领取免费通行证后，可以读全文。</p>
+  $('#body').innerHTML = `${a.abstract ? `<div class="pair"><p class="zh wait" data-s="1">翻译中</p><p class="en">${wrapWords(a.abstract)}</p></div>` : ''}
+    <div class="paywall"><p class="note">${esc(a.source)}只提供标题和摘要，全文要到原网站看，部分媒体需要订阅。</p>
     <div class="row"><a class="btn solid" href="${esc(a.url)}" target="_blank" rel="noopener">打开原文</a></div></div>`;
-  $('#comments').innerHTML = '<h2 class="c-title">读者评论</h2><p class="note">《纽约时报》的评论只能在原文页面查看。</p>';
+  $('#comments').innerHTML = '<h2 class="c-title">读者评论</h2><p class="note">这家媒体的评论只能到原文页面查看。</p>';
+  const sEl = view.querySelector('[data-s]');
+  if (sEl) { const set = t => { sEl.textContent = t; sEl.classList.remove('wait'); }; if (a.zhSummary) set(a.zhSummary); else translate(a.abstract).then(set).catch(() => set('')); }
 }
 async function loadFull(a) {
   const body = $('#body'), key = `article:${a.id}`;
   let art = await idb.get(key);
+  if (!art && a.paras) { art = {en: a.paras, zh: a.paras.map(() => null)}; await idb.set(key, art); }
   if (!art) {
     body.innerHTML = '<p class="loading">正在打开全文。</p>';
     try {
@@ -251,7 +305,7 @@ async function loadFull(a) {
     }
   }
   body.innerHTML = art.en.map((t, i) => `<div class="pair"><p class="zh wait" data-z="${i}">${art.zh[i] ? '' : '翻译中'}</p><p class="en">${wrapWords(t)}</p></div>`).join('') +
-    `<div class="row"><a class="btn" href="${esc(a.url)}" target="_blank" rel="noopener">在卫报打开原文</a></div>`;
+    `<div class="row"><a class="btn" href="${esc(a.url)}" target="_blank" rel="noopener">打开原文</a></div>`;
   art.zh.forEach((z, i) => z && setZh(i, z));
   loadComments(a);
   translateRest(a, art, key, body);
@@ -261,29 +315,20 @@ function setZh(i, text) {
   if (el) { el.textContent = text; el.classList.remove('wait'); }
 }
 async function translateRest(a, art, key, body) {
-  const SIZE = 8;
-  for (;;) {
+  const todo = art.en.map((t, i) => i).filter(i => !art.zh[i]);
+  let failed = 0, lastErr = '';
+  await mapLimit(todo, 4, async i => {
     if (!body.isConnected) return;
-    const todo = [];
-    art.zh.forEach((z, i) => { if (!z && todo.length < SIZE) todo.push(i); });
-    if (!todo.length) return;
-    try {
-      const res = await gemini(`把下面的英文新闻段落翻译成自然、准确的简体中文，供中文读者逐段对照。人名、机构名第一次出现时用常见中文译名。不要增删内容，不要合并段落。
-文章标题：${a.title}
-只输出 JSON：{"zh":["第1段译文", ...]}，数组长度必须是 ${todo.length}。
-段落：${JSON.stringify(todo.map(i => art.en[i]))}`);
-      if (!Array.isArray(res.zh) || res.zh.length !== todo.length) throw new ApiError('Gemini 返回的段落数不对。');
-      todo.forEach((i, n) => { art.zh[i] = String(res.zh[n]); setZh(i, art.zh[i]); });
-      await idb.set(key, art);
-    } catch (e) {
-      if (!body.isConnected) return;
-      view.querySelectorAll('.zh.wait').forEach(el => el.textContent = '');
-      const box = document.createElement('div');
-      box.innerHTML = `<p class="error">后面的段落还没翻译：${esc(e.message)}</p><div class="row"><button class="btn">继续翻译</button></div>`;
-      body.prepend(box);
-      box.querySelector('button').onclick = () => { box.remove(); view.querySelectorAll('.zh.wait').forEach(el => el.textContent = '翻译中'); translateRest(a, art, key, body); };
-      return;
-    }
+    try { art.zh[i] = await translate(art.en[i]); setZh(i, art.zh[i]); }
+    catch (e) { failed++; lastErr = e.message; }
+  });
+  if (todo.length) await idb.set(key, art);
+  if (failed && body.isConnected) {
+    view.querySelectorAll('.zh.wait').forEach(el => el.textContent = '');
+    const box = document.createElement('div');
+    box.innerHTML = `<p class="error">有 ${failed} 段没翻译出来：${esc(lastErr)}</p><div class="row"><button class="btn">继续翻译</button></div>`;
+    body.prepend(box);
+    box.querySelector('button').onclick = () => { box.remove(); view.querySelectorAll('.zh.wait').forEach(el => el.textContent = '翻译中'); translateRest(a, art, key, body); };
   }
 }
 
@@ -309,8 +354,7 @@ async function loadComments(a) {
   $('#c-tr').onclick = async e => {
     const b = e.target; b.disabled = true; b.textContent = '翻译中';
     try {
-      const res = await gemini(`把下面的英文读者评论翻译成自然的简体中文，保留原有语气，不要删改。只输出 JSON：{"zh":[...]}，数组长度必须是 ${cs.length}。\n${JSON.stringify(cs.map(c => c.text))}`);
-      cs.forEach((c, i) => { const el = box.querySelector(`[data-c="${i}"]`); if (el && res.zh?.[i]) { el.textContent = res.zh[i]; el.hidden = false; } });
+      await mapLimit(cs, 4, async (c, i) => { const el = box.querySelector(`[data-c="${i}"]`); if (el) { el.textContent = await translate(c.text); el.hidden = false; } });
       b.remove();
     } catch (err) { b.disabled = false; b.textContent = '再试一次翻译'; const p = document.createElement('p'); p.className = 'error'; p.textContent = err.message; b.after(p); }
   };
@@ -329,34 +373,47 @@ async function fetchLiveNYT() {
   const d = await getJSON(`https://api.nytimes.com/svc/news/v3/content/all/all.json?limit=30&api-key=${encodeURIComponent(keys().nyt)}`, '纽约时报');
   return (d.results || []).filter(a => a.title && a.url && a.abstract).map(a => ({source: 'New York Times', full: false, url: a.url, section: a.section, title: a.title, abstract: a.abstract, byline: a.byline || '', date: a.published_date}));
 }
+let liveTopic = '全部', liveNote = '';
 function renderLive(note) {
+  if (note) liveNote = note;
   if (lastView !== 'live' || document.body.classList.contains('reading')) return;
-  view.innerHTML = `<h1 class="page-title">实时新闻</h1><p class="note live-note">${esc(note)}</p>` + liveItems.map(a =>
-    `<button class="item" data-id="${esc(a.id)}"><h3>${esc(a.zhTitle || a.title)}</h3><p>${esc(a.zhSummary || a.abstract)}</p><div class="src">${esc(a.source)}，${ago(a.date)}</div></button>`).join('');
+  const y = window.scrollY;
+  const shown = liveItems.filter(a => liveTopic === '全部' || topicOf(a) === liveTopic);
+  const sources = new Set(liveItems.map(a => a.source)).size;
+  view.innerHTML = `<h1 class="page-title">实时新闻</h1><p class="note live-note">${esc(liveNote)} 共 ${sources} 家来源。</p>
+    <div class="chips">${['全部', ...TOPICS].map(t => `<button class="chip${t === liveTopic ? ' on' : ''}" data-t="${t}">${t}</button>`).join('')}</div>` + shown.map(a =>
+    `<button class="item" data-id="${esc(a.id)}"><h3>${esc(a.zhTitle || a.title)}</h3>${a.zhSummary ? `<p>${esc(a.zhSummary)}</p>` : ''}<div class="src">${esc(a.source)}，${ago(a.date)}</div></button>`).join('');
   view.querySelectorAll('.item').forEach(el => el.onclick = () => showArticle(el.dataset.id));
+  view.querySelectorAll('.chip').forEach(el => el.onclick = () => { liveTopic = el.dataset.t; renderLive(); window.scrollTo(0, 0); });
+  window.scrollTo(0, y);
 }
 async function refreshLive() {
-  let note = '';
-  const rs = await Promise.allSettled([fetchLiveGuardian(), fetchLiveNYT()]);
+  const rs = await Promise.allSettled([fetchLiveGuardian(), fetchLiveNYT(), fetchFeeds()]);
   const fresh = rs.flatMap(r => r.status === 'fulfilled' ? r.value : []);
   const fail = rs.find(r => r.status === 'rejected');
   if (!fresh.length) { if (lastView === 'live' && !liveItems.length) { view.innerHTML = `<h1 class="page-title">实时新闻</h1><p class="error">${esc(fail?.reason?.message || '暂时没有抓到新闻。')}</p><div class="row"><button class="btn solid" id="live-retry">再试一次</button></div>`; $('#live-retry').onclick = refreshLive; } return; }
   const zh = (await idb.get('liveZh')) || {};
   fresh.sort((a, b) => new Date(b.date) - new Date(a.date));
-  liveItems = fresh.slice(0, 40);
+  const per = {};
+  liveItems = fresh.filter(a => (per[a.source] = (per[a.source] || 0) + 1) <= 10).slice(0, 120);
   liveItems.forEach(a => { a.id = 'live-' + a.url; Object.assign(a, zh[a.url] || {}); registry.set(a.id, a); });
   const time = new Date().toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'});
-  note = `${time} 更新，打开时每 5 分钟自动刷新。${fail ? fail.reason.message : ''}`;
-  renderLive(note);
-  const todo = liveItems.filter(a => !a.zhTitle).slice(0, 20);
-  if (!todo.length) return;
-  try {
-    const res = await gemini(`把这些英文新闻翻译成简体中文。zh_title 是准确、不夸张的标题；zh_summary 是一句话摘要，只用给出的内容。只输出 JSON：{"items":[{"zh_title":"","zh_summary":""}]}，数组长度必须是 ${todo.length}。\n${JSON.stringify(todo.map(a => ({title: a.title, abstract: (a.abstract || '').slice(0, 220)})))}`);
-    todo.forEach((a, i) => { const r = res.items?.[i]; if (r?.zh_title) { a.zhTitle = r.zh_title; a.zhSummary = r.zh_summary; zh[a.url] = {zhTitle: a.zhTitle, zhSummary: a.zhSummary}; } });
+  renderLive(`${time} 更新。`);
+  const todo = liveItems.filter(a => !a.zhTitle);
+  let n = 0;
+  await mapLimit(todo, 5, async a => {
+    try {
+      a.zhTitle = await gtOne(a.title);
+      if (a.abstract) a.zhSummary = await gtOne(a.abstract.slice(0, 300));
+      zh[a.url] = {zhTitle: a.zhTitle, zhSummary: a.zhSummary || ''};
+    } catch {}
+    if (++n % 10 === 0) renderLive();
+  });
+  if (todo.length) {
     const keep = {}; liveItems.forEach(a => { if (zh[a.url]) keep[a.url] = zh[a.url]; });
     await idb.set('liveZh', keep);
-    renderLive(note);
-  } catch (e) { renderLive(`${note} 中文翻译暂时不可用：${e.message}`); }
+    renderLive();
+  }
 }
 function showLive() {
   setTab('live'); lastView = 'live'; document.body.classList.remove('reading');
@@ -418,7 +475,10 @@ async function openWord(el) {
       box.textContent = await gemini(`英文句子：${JSON.stringify(sentence)}
 用简体中文说明其中 "${raw}" 在这句话里的意思，一到两句话；如果它是习语或固定搭配的一部分，指出完整搭配。最后另起一行给出整句的中文翻译。只输出这些内容，不用 Markdown。`, false);
       box.style.whiteSpace = 'pre-line';
-    } catch (e) { box.textContent = e.message; btn.disabled = false; }
+    } catch (e) {
+      try { box.textContent = '整句翻译：' + await translate(sentence); }
+      catch { box.textContent = e.message; btn.disabled = false; }
+    }
   };
 }
 view.addEventListener('click', e => {
@@ -441,7 +501,7 @@ selBtn.onclick = async () => {
   sheet.hidden = back.hidden = false;
   sheet.innerHTML = `<p class="en" style="margin:0">${esc(text)}</p><p class="defs" id="st">翻译中</p>`;
   try {
-    $('#st').textContent = await gemini(`把这段英文翻译成简体中文。如果是习语或固定搭配，再用一句话解释它的用法。只输出这些内容，不用 Markdown。\n${JSON.stringify(text)}`, false);
+    $('#st').textContent = await translate(text);
   } catch (e) { $('#st').textContent = e.message; }
 };
 
@@ -484,9 +544,9 @@ function showSettings(first) {
   const k = keys();
   view.innerHTML = `<h1 class="page-title">${first ? '填好 key 就能开始' : '设置'}</h1>
   ${themeHTML()}<h2 class="c-title">Key</h2>
-  <p class="note">这些 key 都免费，只保存在这台手机上。</p>
+  <p class="note">这些 key 都免费，只保存在这台手机上。BBC、NPR、华盛顿邮报标题等来源不需要 key。</p>
   <label>卫报 Guardian key（必填）<small>提供全文。<a href="https://bonobo.capi.gutools.co.uk/register/developer" target="_blank" rel="noopener">免费申请</a></small><input type="text" id="k-g" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(k.guardian || '')}"></label>
-  <label>Google Gemini key（必填）<small>负责选新闻和翻译。<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">免费申请</a></small><input type="text" id="k-a" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(k.gemini || '')}"></label>
+  <label>Google Gemini key（必填）<small>负责挑选早报新闻和解释单词。<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">免费申请</a></small><input type="text" id="k-a" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(k.gemini || '')}"></label>
   <label>纽约时报 NYT key（可选）<small>提供头条、实时快讯和摘要，不含全文。<a href="https://developer.nytimes.com/get-started" target="_blank" rel="noopener">免费申请</a></small><input type="text" id="k-n" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(k.nyt || '')}"></label>
   <p class="error" id="set-err" hidden></p>
   <div class="row"><button class="btn solid" id="save-k">保存并打开早报</button></div>`;
@@ -502,7 +562,7 @@ function showSettings(first) {
 /* ---------- shell ---------- */
 function setTab(t) { document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === t)); closeSheet(); }
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => ({brief: () => showBrief(), live: showLive, words: showWords, settings: () => showSettings()})[b.dataset.tab]());
-window.addEventListener('popstate', () => { closeSheet(); document.body.classList.remove('reading'); if (lastView === 'live') { const y = ls.get('liveScroll', 0); renderLive('返回列表。'); window.scrollTo(0, y); } else if (current) renderBrief(current); else showBrief(); });
+window.addEventListener('popstate', () => { closeSheet(); document.body.classList.remove('reading'); if (lastView === 'live') { const y = ls.get('liveScroll', 0); renderLive(); window.scrollTo(0, y); } else if (current) renderBrief(current); else showBrief(); });
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 document.addEventListener('visibilitychange', () => { if (!document.hidden) $('#retry')?.click(); });
 applyTheme();
