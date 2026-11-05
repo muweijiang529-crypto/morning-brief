@@ -127,141 +127,179 @@ async function mapLimit(list, n, fn) {
   }));
 }
 
-/* ---------- sources ---------- */
-const GUARDIAN_TOPIC = {'US news': '美国政治', 'World news': '国际', Business: '经济与科技', Technology: '经济与科技', Environment: '气候与环境'};
-const topicOf = a => a.topic || GUARDIAN_TOPIC[a.section] || (/politic|^us$|u\.s\./i.test(a.section || '') ? '美国政治' : /world/i.test(a.section || '') ? '国际' : /business|tech|econom/i.test(a.section || '') ? '经济与科技' : /climate|environment|science/i.test(a.section || '') ? '气候与环境' : /art|film|movie|music|book|culture|tv|sport|style/i.test(a.section || '') ? '文化娱乐' : '国际');
-async function fetchFeeds() {
-  try {
-    const r = await fetch(`feeds.json?t=${Math.floor(Date.now() / 3e5)}`);
-    if (!r.ok) return [];
-    return ((await r.json()).items || []).map(a => ({...a, full: !!a.paras}));
-  } catch { return []; }
-}
-const SECTIONS = 'us-news|world|business|environment|technology|film|tv-and-radio|music|culture|books|sport';
-async function fetchGuardian() {
-  const from = new Date(Date.now() - 36 * 3600e3).toISOString().slice(0, 10);
-  const u = new URLSearchParams({'api-key': keys().guardian, section: SECTIONS, type: 'article', 'from-date': from, 'order-by': 'newest', 'page-size': '60', 'show-fields': 'headline,trailText,byline,wordcount,shortUrl'});
-  const d = await getJSON(`https://content.guardianapis.com/search?${u}`, '卫报');
-  return (d.response?.results || []).filter(a => +(a.fields?.wordcount || 0) >= 250).map(mapGuardian);
-}
-async function fetchNYT() {
-  if (!keys().nyt) return [];
-  const out = [];
-  for (const s of ['home', 'arts']) {
-    const d = await getJSON(`https://api.nytimes.com/svc/topstories/v2/${s}.json?api-key=${encodeURIComponent(keys().nyt)}`, '纽约时报');
-    for (const a of d.results || []) {
-      if (!a.title || !a.url || !a.abstract) continue;
-      if (Date.now() - new Date(a.published_date) > 48 * 3600e3) continue;
-      out.push({source: 'New York Times', side: 'us', full: false, url: a.url, section: a.section, title: a.title, abstract: a.abstract, byline: a.byline || '', date: a.published_date});
-    }
-  }
-  const seen = new Set();
-  return out.filter(a => !seen.has(a.url) && seen.add(a.url)).slice(0, 40);
-}
-function mapGuardian(a) {
-  return {source: 'The Guardian', side: 'intl', full: true, gid: a.id, url: a.webUrl, section: a.sectionName, shortUrl: a.fields?.shortUrl || '',
-    title: a.fields?.headline || a.webTitle, abstract: stripTags(a.fields?.trailText), byline: a.fields?.byline || '', date: a.webPublicationDate};
-}
-function stripTags(h) { return new DOMParser().parseFromString(h || '', 'text/html').body.textContent.trim(); }
-
+/* ---------- finished data from the cloud ---------- */
+const DATA = 'https://raw.githubusercontent.com/muweijiang529-crypto/morning-brief/data/';
 const TOPICS = ['美国政治', '国际', '经济与科技', '气候与环境', '文化娱乐'];
-async function buildBrief() {
-  const results = await Promise.allSettled([fetchGuardian(), fetchNYT(), fetchFeeds()]);
-  const cands = results.flatMap(r => r.status === 'fulfilled' ? r.value : []);
-  const failed = results.filter(r => r.status === 'rejected').map(r => r.reason.message);
-  if (!cands.length) throw new ApiError(failed[0] || '过去一天没有抓到新闻。');
-  const perSource = {};
-  const pool = cands.filter(a => (perSource[a.source] = (perSource[a.source] || 0) + 1) <= 12);
-  const list = pool.map((a, i) => ({i, source: a.source, topic: topicOf(a), title: a.title, abstract: (a.abstract || '').slice(0, 160)}));
-  let items;
-  try {
-    const res = await gemini(`你是一位给中文读者编早报的资深编辑。读者住在美国，想跟上美国和国际新闻，并融入美国社会，也关心娱乐文化。
-从下面的候选新闻中选出最重要的 18 条，合起来 5–10 分钟读完。要求：
-- 重要的事件优先，不选小众或琐碎内容；同一事件只留一条。
-- 来源尽量多样，不要集中在一两家媒体；同一来源不超过 4 条。
-- topic 只能从这些里选：${TOPICS.join('、')}。文化娱乐选 2–3 条，美国政治和国际占大头。
-- zh_title：准确、不夸张的中文标题，不超过 24 个字。
-- zh_summary：凝练的中文摘要，不超过 60 个字，说清发生了什么和为什么重要；陌生的美国人名、机构顺带说明。只使用候选内容里有的事实，没有摘要的只概括标题，不要补充，不要加入自己的立场。
-- 按重要性排序，第一条是今天最重要的新闻。
-只输出 JSON：{"items":[{"i":候选序号,"topic":"","zh_title":"","zh_summary":""}]}
-
-候选：
-${JSON.stringify(list)}`);
-    items = (res.items || []).filter(x => pool[x.i]).map(x => ({...pool[x.i], topic: TOPICS.includes(x.topic) ? x.topic : topicOf(pool[x.i]), zhTitle: x.zh_title, zhSummary: x.zh_summary}));
-    if (!items.length) throw new ApiError('Gemini 没有选出新闻。');
-  } catch (e) {
-    /* AI unavailable: still give a translated brief, chosen by simple rotation across sources. */
-    const seen = {}, picked = [];
-    for (const a of pool) { const k = a.source + topicOf(a); if (!seen[k] && picked.length < 18) { seen[k] = 1; picked.push(a); } }
-    items = picked.map(a => ({...a, topic: topicOf(a)}));
-    await mapLimit(items, 4, async a => { a.zhTitle = await translate(a.title).catch(() => a.title); a.zhSummary = a.abstract ? await translate(a.abstract).catch(() => a.abstract) : ''; });
-    failed.push('AI 选稿暂时不可用，这期按来源轮流选取。');
-  }
-  items.forEach((a, n) => a.id = `${today()}-${n}`);
-  const brief = {date: today(), items, warning: failed[0] || '', read: []};
-  await idb.set(`b2:${today()}`, brief);
-  prune();
-  return brief;
+const registry = new Map();
+function stripTags(h) { return new DOMParser().parseFromString(h || '', 'text/html').body.textContent.trim(); }
+async function timed(url, ms = 15000) {
+  const c = new AbortController(), t = setTimeout(() => c.abort(), ms);
+  try { return await fetch(url, {signal: c.signal, cache: 'no-cache'}); }
+  finally { clearTimeout(t); }
+}
+function normalize(a) {
+  a.zhTitle = a.zh_title || a.zhTitle || '';
+  a.zhSummary = a.zh_summary || a.zhSummary || '';
+  a.full = !!(a.paras || (a.gid && keys().guardian));
+  registry.set(a.id, a);
+  return a;
+}
+const store = {feeds: null, brief: null, loading: null};
+async function loadCached() {
+  if (!store.feeds) store.feeds = await idb.get('feeds') || null;
+  if (!store.brief) store.brief = await idb.get('brief') || null;
+  store.feeds?.items.forEach(normalize);
+  store.brief?.items.forEach(normalize);
+}
+/* Download the latest files. Old data stays on screen if anything fails. */
+function refreshData() {
+  if (store.loading) return store.loading;
+  store.loading = (async () => {
+    const stamp = Math.floor(Date.now() / 6e4);
+    const [f, b] = await Promise.all(['feeds', 'brief'].map(async n => {
+      const r = await timed(`${DATA}${n}.json?t=${stamp}`, 25000);
+      if (!r.ok) throw new ApiError(`数据暂时取不到（${r.status}）。`);
+      return r.json();
+    }));
+    const changed = f.updated !== store.feeds?.updated, briefChanged = b.date !== store.brief?.date || b.built !== store.brief?.built;
+    store.feeds = f; store.brief = b;
+    f.items.forEach(normalize); b.items.forEach(normalize);
+    idb.set('feeds', f); idb.set('brief', b);
+    return {changed, briefChanged};
+  })().finally(() => { store.loading = null; });
+  return store.loading;
 }
 async function prune() {
-  const all = await idb.keys(), cutoff = Date.now() - 7 * 864e5;
-  for (const k of all) {
-    const m = String(k).match(/(\d{4}-\d{2}-\d{2})/);
-    if (m && new Date(m[1]) < cutoff) idb.del(k);
-  }
+  const all = await idb.keys(), used = new Set([...(store.brief?.items || []), ...(store.feeds?.items || [])].map(a => `article:${a.id}`));
+  for (const k of all) if (String(k).startsWith('article:') && !used.has(k)) idb.del(k);
 }
+const readSet = () => new Set(ls.get('read', []));
+function markRead(id) { const r = ls.get('read', []); if (!r.includes(id)) { r.push(id); ls.set('read', r.slice(-400)); } }
+
+/* ---------- list rendering ---------- */
+let lastView = 'brief', listState = null;
+const WEEK = '日一二三四五六';
+const ago = d => { const m = Math.max(0, Math.round((Date.now() - new Date(d)) / 6e4)); return m < 60 ? `${m} 分钟前` : m < 1440 ? `${Math.round(m / 60)} 小时前` : `${Math.round(m / 1440)} 天前`; };
+function itemHTML(a, opts = {}) {
+  const read = readSet().has(a.id);
+  const img = a.image ? `<img class="thumb" loading="lazy" referrerpolicy="no-referrer" alt="" src="${esc(a.image)}">` : '';
+  return `<button class="item${opts.lead ? ' lead' : ''}${read ? ' read' : ''}${a.image ? ' has-img' : ''}" data-id="${esc(a.id)}">${img}<span class="tx"><h3>${esc(a.zhTitle || a.title)}</h3>${a.zhSummary ? `<p>${esc(a.zhSummary)}</p>` : ''}<span class="src">${esc(a.source)}，${ago(a.date)}${a.full ? '，可读全文' : ''}</span></span></button>`;
+}
+function bindItems(root) {
+  root.querySelectorAll('.item:not([data-b])').forEach(el => {
+    el.dataset.b = 1;
+    el.onclick = () => showArticle(el.dataset.id);
+    const im = el.querySelector('img');
+    if (im) im.onerror = () => { im.remove(); el.classList.remove('has-img'); };
+  });
+}
+/* Endless list: more stories load as you reach the bottom. */
+let endless = null;
+function startEndless(pool, host) {
+  endless?.disconnect();
+  let i = 0;
+  const sentinel = document.createElement('div');
+  sentinel.className = 'more-end';
+  host.after(sentinel);
+  const step = () => {
+    const part = pool.slice(i, i + 20); i += part.length;
+    host.insertAdjacentHTML('beforeend', part.map(a => itemHTML(a)).join(''));
+    bindItems(host);
+    if (i >= pool.length) { endless?.disconnect(); sentinel.textContent = pool.length ? '已经看完新闻库了。下拉可以检查新内容。' : ''; }
+    else sentinel.textContent = '正在加载更多';
+  };
+  step();
+  endless = new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) step(); }, {rootMargin: '800px'});
+  endless.observe(sentinel);
+}
+function statusLine() {
+  const f = store.feeds;
+  if (!f) return '';
+  const m = Math.round((Date.now() - new Date(f.updated)) / 6e4);
+  return m < 1 ? '刚刚更新' : m < 60 ? `${m} 分钟前更新` : `${Math.round(m / 60)} 小时前更新`;
+}
+const skeleton = n => `<div class="skel">${'<div></div>'.repeat(n)}</div>`;
 
 /* ---------- brief view ---------- */
-let current = null, lastView = 'brief';
-const registry = new Map();
-const WEEK = '日一二三四五六';
-function mastHTML(b) {
-  const d = new Date(), read = b ? b.read.length : 0, total = b ? b.items.length : 0, pct = total ? read / total * 100 : 0;
-  const mins = total ? Math.max(1, Math.round(b.items.slice(read ? 0 : 0).reduce((s, a) => s + (a.zhSummary || '').length + a.zhTitle.length, 0) / 350)) : 0;
-  return `<header class="mast"><h1 class="date">${d.getMonth()+1}月${d.getDate()}日，周${WEEK[d.getDay()]}</h1>
-    <p class="sub">${total ? `昨天以来的 ${total} 条新闻，摘要约 ${mins} 分钟读完。已读 ${read} 条。` : '正在整理昨天以来的新闻。'}</p>
-    <div class="horizon" aria-hidden="true"><div class="fill" style="width:${pct}%"></div><div class="sun" style="left:calc(14px + (100% - 28px) * ${pct / 100})"></div></div></header>`;
-}
-async function showBrief(force) {
-  setTab('brief'); lastView = 'brief';
-  document.body.classList.remove('reading');
-  if (!keys().guardian || !keys().gemini) return showSettings(true);
-  let b = force ? null : await idb.get(`b2:${today()}`);
+function briefDateText(s) { const d = new Date(s + 'T12:00:00'); return `${d.getMonth() + 1}月${d.getDate()}日，周${WEEK[d.getDay()]}`; }
+function renderBrief() {
+  lastView = 'brief'; setTab('brief'); document.body.classList.remove('reading'); endless?.disconnect();
+  const b = store.brief;
   if (!b) {
-    view.innerHTML = mastHTML(null) + '<p class="loading">正在抓取并翻译，第一次打开要等大约一分钟，请停留在这个页面。</p>';
-    try { b = await buildBrief(); }
-    catch (e) {
-      const old = await latestBrief();
-      view.innerHTML = mastHTML(null) + `<p class="error">${esc(e.message)}</p><div class="row"><button class="btn solid" id="retry">再试一次</button>${old ? '<button class="btn" id="oldb">看上一期</button>' : ''}<button class="btn" id="toset">打开设置</button></div>`;
-      $('#retry').onclick = () => showBrief(true);
-      $('#toset').onclick = () => showSettings();
-      if (old) $('#oldb').onclick = () => renderBrief(old);
-      return;
-    }
+    view.innerHTML = `<header class="mast"><h1 class="date">晨读</h1><p class="sub">正在取今天的新闻。</p></header>${skeleton(5)}<p class="error" id="load-err" hidden></p>`;
+    return;
   }
-  renderBrief(b);
-}
-async function latestBrief() {
-  const ks = (await idb.keys()).filter(k => String(k).startsWith('b2:')).sort();
-  return ks.length ? idb.get(ks[ks.length - 1]) : null;
-}
-function renderBrief(b) {
-  current = b; lastView = 'brief';
-  b.items.forEach(a => registry.set(a.id, a));
-  let html = mastHTML(b), lastTopic = null, first = true;
-  if (b.warning) html += `<p class="note">${esc(b.warning)}</p>`;
-  const ordered = [];
-  for (const t of TOPICS) b.items.filter(a => a.topic === t).forEach(a => ordered.push(a));
-  for (const a of ordered) {
-    if (a.topic !== lastTopic) { html += `<h2 class="topic">${esc(a.topic)}</h2>`; lastTopic = a.topic; }
-    html += `<button class="item${first ? ' lead' : ''}${b.read.includes(a.id) ? ' read' : ''}" data-id="${esc(a.id)}"><h3>${esc(a.zhTitle)}</h3>${a.zhSummary ? `<p>${esc(a.zhSummary)}</p>` : ''}<div class="src">${esc(a.source)}${a.full ? '' : '，打开可看原文'}</div></button>`;
-    first = false;
+  const read = readSet(), done = b.items.filter(a => read.has(a.id)).length, total = b.items.length, pct = total ? done / total * 100 : 0;
+  const mins = Math.max(3, Math.round(b.items.reduce((s, a) => s + (a.zhSummary || '').length + (a.zhTitle || '').length, 0) / 350));
+  let html = `<header class="mast"><h1 class="date">${briefDateText(b.date)}</h1>
+    <p class="sub">今日早报 ${total} 条，约 ${mins} 分钟读完。已读 ${done} 条。</p>
+    <div class="horizon" aria-hidden="true"><div class="fill" style="width:${pct}%"></div><div class="sun" style="left:calc(14px + (100% - 28px) * ${pct / 100})"></div></div></header>`;
+  const lead = b.items[0];
+  html += `<div id="brief-list">${itemHTML(lead, {lead: true})}`;
+  for (const t of TOPICS) {
+    const inTopic = b.items.slice(1).filter(a => a.topic === t);
+    if (inTopic.length) html += `<h2 class="topic">${t}</h2>` + inTopic.map(a => itemHTML(a)).join('');
   }
-  html += `<div class="row"><button class="btn" id="refresh">重新抓取今天的新闻</button></div>`;
+  html += `</div><h2 class="topic more-title">更多新闻</h2><div id="more-list"></div>`;
   view.innerHTML = html;
-  view.querySelectorAll('.item').forEach(el => el.onclick = () => showArticle(el.dataset.id));
-  $('#refresh').onclick = () => showBrief(true);
-  window.scrollTo(0, ls.get('briefScroll', 0));
+  bindItems($('#brief-list'));
+  const used = new Set(b.items.map(a => a.url));
+  startEndless((store.feeds?.items || []).filter(a => !used.has(a.url)), $('#more-list'));
+  prefetch(b.items);
+}
+
+/* Prepare the bilingual text of the morning stories while the app is open. */
+let prefetching = false;
+async function prefetch(items) {
+  if (prefetching) return;
+  prefetching = true;
+  try {
+    const list = items.filter(a => a.full).slice(0, 10);
+    await mapLimit(list, 2, async a => { try { const art = await articleData(a); await fillTranslation(art, `article:${a.id}`); } catch {} });
+  } finally { prefetching = false; }
+}
+
+/* ---------- pull to refresh ---------- */
+const pull = document.createElement('div');
+pull.id = 'pull'; pull.textContent = '下拉检查新内容';
+document.body.prepend(pull);
+let pullY = null;
+document.addEventListener('touchstart', e => { pullY = (window.scrollY <= 0 && !document.body.classList.contains('reading') && ['brief', 'live'].includes(lastView)) ? e.touches[0].clientY : null; }, {passive: true});
+document.addEventListener('touchmove', e => {
+  if (pullY === null) return;
+  const d = Math.min(e.touches[0].clientY - pullY, 110);
+  if (d <= 0) { pull.style.transform = ''; return; }
+  pull.style.transform = `translateY(${d}px)`;
+  pull.textContent = d > 70 ? '松开刷新' : '下拉检查新内容';
+}, {passive: true});
+document.addEventListener('touchend', async e => {
+  if (pullY === null) return;
+  const d = e.changedTouches[0].clientY - pullY; pullY = null;
+  if (d > 70) { pull.textContent = '正在检查'; pull.style.transform = 'translateY(70px)'; await syncNow(true); }
+  pull.style.transform = '';
+});
+function toast(t) {
+  let el = $('#toast');
+  if (!el) { el = document.createElement('div'); el.id = 'toast'; document.body.append(el); }
+  el.textContent = t; el.classList.add('on');
+  clearTimeout(toast.t); toast.t = setTimeout(() => el.classList.remove('on'), 2600);
+}
+async function syncNow(tell) {
+  const hadBrief = !!store.brief;
+  try {
+    const {changed, briefChanged} = await refreshData();
+    const y = window.scrollY, reading = document.body.classList.contains('reading');
+    if (!reading && (changed || briefChanged || !hadBrief)) {
+      if (lastView === 'brief' && (briefChanged || y < 50 || !hadBrief)) renderBrief();
+      else if (lastView === 'live' && y < 50) renderLive();
+      else if (changed) toast('有新内容，回到顶部下拉查看');
+    }
+    if (tell) toast(changed ? '已更新' : `已是最新，${statusLine()}`);
+    prune();
+  } catch (e) {
+    if (!store.brief) { const el = $('#load-err'); if (el) { el.hidden = false; el.innerHTML = `${esc(e.name === 'AbortError' ? '网络太慢，没有取到新闻。' : e.message || '没有取到新闻。')} <button class="btn" id="retry">再试一次</button>`; $('#retry').onclick = () => { el.hidden = true; syncNow(); }; } }
+    else if (tell) toast('现在连不上网络，先显示已保存的内容');
+  }
 }
 
 /* ---------- article view ---------- */
@@ -271,40 +309,70 @@ async function showArticle(id) {
   ls.set(lastView === 'live' ? 'liveScroll' : 'briefScroll', window.scrollY);
   document.body.classList.add('reading');
   history.pushState({article: id}, '');
-  if (current && current.items.some(x => x.id === id) && !current.read.includes(id)) { current.read.push(id); idb.set(`b2:${current.date}`, current); }
+  markRead(id);
   window.scrollTo(0, 0);
   view.innerHTML = `<button class="back" id="back">‹ 返回</button>
     <h1 class="art-zh-title">${esc(a.zhTitle || a.title)}</h1>
     <h2 class="art-en-title">${wrapWords(a.title)}</h2>
-    <p class="art-meta">${esc(a.source)}${a.byline ? '，' + esc(a.byline) : ''}</p><div id="body"></div><div id="related"></div><div id="comments"></div>`;
+    <p class="art-meta">${esc(a.source)}，${ago(a.date)}</p>${a.image ? `<img class="art-img" referrerpolicy="no-referrer" alt="" src="${esc(a.image)}" onerror="this.remove()">` : ''}<div id="body"></div><div id="related"></div><div id="comments"></div>`;
   $('#back').onclick = () => history.back();
   if (a.full) return loadFull(a);
   $('#body').innerHTML = `${a.abstract ? `<div class="pair"><p class="zh wait" data-s="1">翻译中</p><p class="en">${wrapWords(a.abstract)}</p></div>` : ''}
-    <div class="paywall"><p class="note">${esc(a.source)}在这里只有标题或摘要。全文要到原网站看，部分媒体需要订阅。</p>
+    <div class="paywall"><p class="note">${a.gid ? '到“设置”填入卫报 key 后，可以在这里读全文。' : esc(a.source) + '在这里只有标题或摘要。全文要到原网站看，部分媒体需要订阅。'}</p>
     <div class="row"><a class="btn solid" href="${esc(a.url)}" target="_blank" rel="noopener">打开原文</a></div></div>`;
   $('#comments').innerHTML = '<h2 class="c-title">读者评论</h2><p class="note">这家媒体的评论只能到原文页面查看。</p>';
-  loadRelated(a);
+  if (keys().guardian) loadRelated(a);
   const sEl = view.querySelector('[data-s]');
   if (sEl) { const set = t => { sEl.textContent = t; sEl.classList.remove('wait'); }; if (a.zhSummary) set(a.zhSummary); else translate(a.abstract).then(set).catch(() => set('')); }
 }
-async function loadFull(a) {
-  const body = $('#body'), key = `article:${a.id}`;
-  let art = await idb.get(key);
-  if (!art && a.paras) { art = {en: a.paras, zh: a.paras.map(() => null)}; await idb.set(key, art); }
-  if (!art) {
-    body.innerHTML = '<p class="loading">正在打开全文。</p>';
-    try {
-      const d = await getJSON(`https://content.guardianapis.com/${a.gid.split('/').map(encodeURIComponent).join('/')}?${new URLSearchParams({'api-key': keys().guardian, 'show-fields': 'body'})}`, '卫报');
-      const doc = new DOMParser().parseFromString(d.response?.content?.fields?.body || '', 'text/html');
+const artJobs = new Map();
+function articleData(a) {
+  const key = `article:${a.id}`;
+  if (artJobs.has(key)) return artJobs.get(key);
+  const job = (async () => {
+    let art = await idb.get(key);
+    if (art) { if (art.shortUrl) a.shortUrl = art.shortUrl; return art; }
+    if (a.paras) art = {en: a.paras, zh: a.paras.map(() => null)};
+    else {
+      const d = await getJSON(`https://content.guardianapis.com/${a.gid.split('/').map(encodeURIComponent).join('/')}?${new URLSearchParams({'api-key': keys().guardian, 'show-fields': 'body,shortUrl'})}`, '卫报');
+      const f = d.response?.content?.fields || {};
+      const doc = new DOMParser().parseFromString(f.body || '', 'text/html');
       const paras = [...doc.querySelectorAll('p,h2')].map(p => p.textContent.replace(/\s+/g, ' ').trim()).filter(t => t.length > 1);
       if (!paras.length) throw new ApiError('这篇文章没有可读取的正文。');
-      art = {en: paras, zh: paras.map(() => null)};
-      await idb.set(key, art);
-    } catch (e) {
-      body.innerHTML = `<p class="error">${esc(e.message)}</p><div class="row"><a class="btn" href="${esc(a.url)}" target="_blank" rel="noopener">打开原文</a></div>`;
-      return;
+      art = {en: paras, zh: paras.map(() => null), shortUrl: f.shortUrl || ''};
+      a.shortUrl = art.shortUrl;
     }
+    await idb.set(key, art);
+    return art;
+  })().finally(() => artJobs.delete(key));
+  artJobs.set(key, job);
+  return job;
+}
+function fillTranslation(art, key, onPara) {
+  const run = (async () => {
+    let failed = 0, lastErr = '';
+    const todo = art.en.map((t, i) => i).filter(i => !art.zh[i]);
+    await mapLimit(todo, 4, async i => {
+      if (art.zh[i]) return;
+      try { art.zh[i] = await translate(art.en[i]); onPara?.(i, art.zh[i]); }
+      catch (e) { failed++; lastErr = e.message; }
+    });
+    if (todo.length) await idb.set(key, art);
+    return {failed, lastErr};
+  })();
+  return run;
+}
+async function loadFull(a) {
+  const body = $('#body'), key = `article:${a.id}`;
+  body.innerHTML = skeleton(4);
+  let art;
+  try { art = await articleData(a); }
+  catch (e) {
+    if (!body.isConnected) return;
+    body.innerHTML = `<p class="error">${esc(e.message)}</p><div class="row"><a class="btn" href="${esc(a.url)}" target="_blank" rel="noopener">打开原文</a></div>`;
+    return;
   }
+  if (!body.isConnected) return;
   body.innerHTML = art.en.map((t, i) => `<div class="pair"><p class="zh wait" data-z="${i}">${art.zh[i] ? '' : '翻译中'}</p><p class="en">${wrapWords(t)}</p></div>`).join('') +
     `<div class="row"><a class="btn" href="${esc(a.url)}" target="_blank" rel="noopener">打开原文</a></div>`;
   art.zh.forEach((z, i) => z && setZh(i, z));
@@ -316,14 +384,7 @@ function setZh(i, text) {
   if (el) { el.textContent = text; el.classList.remove('wait'); }
 }
 async function translateRest(a, art, key, body) {
-  const todo = art.en.map((t, i) => i).filter(i => !art.zh[i]);
-  let failed = 0, lastErr = '';
-  await mapLimit(todo, 4, async i => {
-    if (!body.isConnected) return;
-    try { art.zh[i] = await translate(art.en[i]); setZh(i, art.zh[i]); }
-    catch (e) { failed++; lastErr = e.message; }
-  });
-  if (todo.length) await idb.set(key, art);
+  const {failed, lastErr} = await fillTranslation(art, key, (i, z) => { if (body.isConnected) setZh(i, z); });
   if (failed && body.isConnected) {
     view.querySelectorAll('.zh.wait').forEach(el => el.textContent = '');
     const box = document.createElement('div');
@@ -383,69 +444,19 @@ async function loadComments(a) {
 }
 
 /* ---------- live feed ---------- */
-let liveTimer = null, liveItems = [];
-const ago = d => { const m = Math.max(0, Math.round((Date.now() - new Date(d)) / 6e4)); return m < 60 ? `${m} 分钟前` : m < 1440 ? `${Math.round(m / 60)} 小时前` : `${Math.round(m / 1440)} 天前`; };
-async function fetchLiveGuardian() {
-  const u = new URLSearchParams({'api-key': keys().guardian, section: SECTIONS, type: 'article', 'order-by': 'newest', 'page-size': '30', 'show-fields': 'headline,trailText,byline,wordcount,shortUrl'});
-  const d = await getJSON(`https://content.guardianapis.com/search?${u}`, '卫报');
-  return (d.response?.results || []).map(mapGuardian);
-}
-async function fetchLiveNYT() {
-  if (!keys().nyt) return [];
-  const d = await getJSON(`https://api.nytimes.com/svc/news/v3/content/all/all.json?limit=30&api-key=${encodeURIComponent(keys().nyt)}`, '纽约时报');
-  return (d.results || []).filter(a => a.title && a.url && a.abstract).map(a => ({source: 'New York Times', full: false, url: a.url, section: a.section, title: a.title, abstract: a.abstract, byline: a.byline || '', date: a.published_date}));
-}
-let liveTopic = '全部', liveNote = '';
-function renderLive(note) {
-  if (note) liveNote = note;
-  if (lastView !== 'live' || document.body.classList.contains('reading')) return;
-  const y = window.scrollY;
-  const shown = liveItems.filter(a => liveTopic === '全部' || topicOf(a) === liveTopic);
-  const sources = new Set(liveItems.map(a => a.source)).size;
-  view.innerHTML = `<h1 class="page-title">实时新闻</h1><p class="note live-note">${esc(liveNote)} 共 ${sources} 家来源。</p>
-    <div class="chips">${['全部', ...TOPICS].map(t => `<button class="chip${t === liveTopic ? ' on' : ''}" data-t="${t}">${t}</button>`).join('')}</div>` + shown.map(a =>
-    `<button class="item" data-id="${esc(a.id)}"><h3>${esc(a.zhTitle || a.title)}</h3>${a.zhSummary ? `<p>${esc(a.zhSummary)}</p>` : ''}<div class="src">${esc(a.source)}，${ago(a.date)}</div></button>`).join('');
-  view.querySelectorAll('.item').forEach(el => el.onclick = () => showArticle(el.dataset.id));
+let liveTopic = '全部';
+function renderLive() {
+  lastView = 'live'; setTab('live'); document.body.classList.remove('reading'); endless?.disconnect();
+  const f = store.feeds;
+  if (!f) { view.innerHTML = `<h1 class="page-title">实时新闻</h1>${skeleton(5)}<p class="error" id="load-err" hidden></p>`; return; }
+  const shown = f.items.filter(a => liveTopic === '全部' || a.topic === liveTopic);
+  const sources = Object.values(f.counts || {}).filter(Boolean).length;
+  view.innerHTML = `<h1 class="page-title">实时新闻</h1><p class="note live-note">${statusLine()}，${sources} 家媒体，${f.total} 条。</p>
+    <div class="chips">${['全部', ...TOPICS].map(t => `<button class="chip${t === liveTopic ? ' on' : ''}" data-t="${t}">${t}</button>`).join('')}</div><div id="live-list"></div>`;
   view.querySelectorAll('.chip').forEach(el => el.onclick = () => { liveTopic = el.dataset.t; renderLive(); window.scrollTo(0, 0); });
-  window.scrollTo(0, y);
+  startEndless(shown, $('#live-list'));
 }
-async function refreshLive() {
-  const rs = await Promise.allSettled([fetchLiveGuardian(), fetchLiveNYT(), fetchFeeds()]);
-  const fresh = rs.flatMap(r => r.status === 'fulfilled' ? r.value : []);
-  const fail = rs.find(r => r.status === 'rejected');
-  if (!fresh.length) { if (lastView === 'live' && !liveItems.length) { view.innerHTML = `<h1 class="page-title">实时新闻</h1><p class="error">${esc(fail?.reason?.message || '暂时没有抓到新闻。')}</p><div class="row"><button class="btn solid" id="live-retry">再试一次</button></div>`; $('#live-retry').onclick = refreshLive; } return; }
-  const zh = (await idb.get('liveZh')) || {};
-  fresh.sort((a, b) => new Date(b.date) - new Date(a.date));
-  const per = {};
-  liveItems = fresh.filter(a => (per[a.source] = (per[a.source] || 0) + 1) <= 10).slice(0, 120);
-  liveItems.forEach(a => { a.id = 'live-' + a.url; Object.assign(a, zh[a.url] || {}); registry.set(a.id, a); });
-  const time = new Date().toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'});
-  renderLive(`${time} 更新。`);
-  const todo = liveItems.filter(a => !a.zhTitle);
-  let n = 0;
-  await mapLimit(todo, 5, async a => {
-    try {
-      a.zhTitle = await gtOne(a.title);
-      if (a.abstract) a.zhSummary = await gtOne(a.abstract.slice(0, 300));
-      zh[a.url] = {zhTitle: a.zhTitle, zhSummary: a.zhSummary || ''};
-    } catch {}
-    if (++n % 10 === 0) renderLive();
-  });
-  if (todo.length) {
-    const keep = {}; liveItems.forEach(a => { if (zh[a.url]) keep[a.url] = zh[a.url]; });
-    await idb.set('liveZh', keep);
-    renderLive();
-  }
-}
-function showLive() {
-  setTab('live'); lastView = 'live'; document.body.classList.remove('reading');
-  if (!keys().guardian || !keys().gemini) return showSettings(true);
-  if (liveItems.length) renderLive('正在检查新内容。');
-  else view.innerHTML = '<h1 class="page-title">实时新闻</h1><p class="loading">正在抓取最新新闻。</p>';
-  refreshLive();
-  clearInterval(liveTimer);
-  liveTimer = setInterval(() => { if (lastView === 'live' && !document.hidden && !document.body.classList.contains('reading')) refreshLive(); }, 5 * 60e3);
-}
+const showLive = () => { renderLive(); window.scrollTo(0, 0); syncNow(); };
 
 /* ---------- dictionary ---------- */
 let dictP;
@@ -529,7 +540,7 @@ selBtn.onclick = async () => {
 
 /* ---------- vocabulary ---------- */
 function showWords() {
-  setTab('words'); lastView = 'words'; document.body.classList.remove('reading');
+  endless?.disconnect(); setTab('words'); lastView = 'words'; document.body.classList.remove('reading');
   const list = ls.get('words', []);
   view.innerHTML = `<h1 class="page-title">生词本</h1>` + (list.length
     ? list.map((x, i) => `<div class="word-row"><button data-del="${i}">删除</button><b>${esc(x.word)}</b>${x.ph ? ` <span class="note">/${esc(x.ph)}/</span>` : ''}<div class="d">${esc(x.tr)}</div><div class="ex">${esc(x.ex)}</div></div>`).join('')
@@ -565,31 +576,43 @@ function bindTheme() {
 
 /* ---------- settings ---------- */
 function showSettings(first) {
-  setTab('settings'); lastView = 'settings'; document.body.classList.remove('reading');
+  endless?.disconnect(); setTab('settings'); lastView = 'settings'; document.body.classList.remove('reading');
   const k = keys();
-  view.innerHTML = `<h1 class="page-title">${first ? '填好 key 就能开始' : '设置'}</h1>
+  view.innerHTML = `<h1 class="page-title">设置</h1>
   ${themeHTML()}<h2 class="c-title">Key</h2>
-  <p class="note">这些 key 都免费，只保存在这台手机上。BBC、NPR、华盛顿邮报标题等来源不需要 key。</p>
-  <label>卫报 Guardian key（必填）<small>提供全文。<a href="https://bonobo.capi.gutools.co.uk/register/developer" target="_blank" rel="noopener">免费申请</a></small><input type="text" id="k-g" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(k.guardian || '')}"></label>
-  <label>Google Gemini key（必填）<small>负责挑选早报新闻和解释单词。<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">免费申请</a></small><input type="text" id="k-a" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(k.gemini || '')}"></label>
-  <label>纽约时报 NYT key（可选）<small>提供头条、实时快讯和摘要，不含全文。<a href="https://developer.nytimes.com/get-started" target="_blank" rel="noopener">免费申请</a></small><input type="text" id="k-n" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(k.nyt || '')}"></label>
+  <p class="note">看新闻不需要 key。填了 key 可以多两个功能，都只保存在这台手机上。</p>
+  <label>卫报 Guardian key<small>在 App 里读卫报全文和评论。<a href="https://bonobo.capi.gutools.co.uk/register/developer" target="_blank" rel="noopener">免费申请</a></small><input type="text" id="k-g" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(k.guardian || '')}"></label>
+  <label>Google Gemini key<small>解释单词在句子里的意思。<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">免费申请</a></small><input type="text" id="k-a" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(k.gemini || '')}"></label>
   <p class="error" id="set-err" hidden></p>
-  <div class="row"><button class="btn solid" id="save-k">保存并打开早报</button></div>`;
+  <div class="row"><button class="btn solid" id="save-k">保存</button></div>`;
   bindTheme();
   $('#save-k').onclick = () => {
-    const g = $('#k-g').value.trim(), a = $('#k-a').value.trim(), n = $('#k-n').value.trim();
-    if (!g || !a) { const e = $('#set-err'); e.hidden = false; e.textContent = '卫报和 Gemini 的 key 都要填。'; return; }
-    ls.set('keys', {guardian: g, gemini: a, nyt: n});
-    showBrief();
+    ls.set('keys', {guardian: $('#k-g').value.trim(), gemini: $('#k-a').value.trim()});
+    store.feeds?.items.forEach(normalize); store.brief?.items.forEach(normalize);
+    toast('已保存');
   };
 }
 
 /* ---------- shell ---------- */
 function setTab(t) { document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === t)); closeSheet(); }
-document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => ({brief: () => showBrief(), live: showLive, words: showWords, settings: () => showSettings()})[b.dataset.tab]());
-window.addEventListener('popstate', () => { closeSheet(); document.body.classList.remove('reading'); if (lastView === 'live') { const y = ls.get('liveScroll', 0); renderLive(); window.scrollTo(0, y); } else if (current) renderBrief(current); else showBrief(); });
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => ({brief: () => { renderBrief(); window.scrollTo(0, 0); syncNow(); }, live: showLive, words: showWords, settings: () => showSettings()})[b.dataset.tab]());
+window.addEventListener('popstate', () => {
+  closeSheet(); document.body.classList.remove('reading');
+  if (lastView === 'live') { renderLive(); window.scrollTo(0, ls.get('liveScroll', 0)); }
+  else { renderBrief(); window.scrollTo(0, ls.get('briefScroll', 0)); }
+});
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
-document.addEventListener('visibilitychange', () => { if (!document.hidden) $('#retry')?.click(); });
+/* Coming back to the app (next morning, or after a while) always checks for new content. */
+let lastSync = 0;
+document.addEventListener('visibilitychange', () => { if (!document.hidden && Date.now() - lastSync > 6e4) { lastSync = Date.now(); syncNow(); } });
+setInterval(() => { if (!document.hidden && !document.body.classList.contains('reading')) { lastSync = Date.now(); syncNow(); } }, 5 * 60e3);
+window.addEventListener('error', () => {});
+window.addEventListener('unhandledrejection', e => e.preventDefault());
 applyTheme();
 applySize();
-showBrief();
+(async () => {
+  try { await loadCached(); } catch {}
+  renderBrief();
+  lastSync = Date.now();
+  syncNow();
+})();
