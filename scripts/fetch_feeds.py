@@ -324,7 +324,7 @@ def main():
     today = now.strftime('%Y-%m-%d')
     brief = prev_brief
     stale = prev_brief.get('date') != today
-    retry_ai = not stale and not prev_brief.get('ai') and now.hour < 10 and os.environ.get('GEMINI_API_KEY')
+    retry_ai = not stale and not prev_brief.get('ai') and os.environ.get('GEMINI_API_KEY')
     if now.hour >= BRIEF_HOUR and (stale or retry_ai):
         chosen, ai = build_brief(items)
         brief = {'date': today, 'built': datetime.now(timezone.utc).isoformat(), 'ai': ai, 'items': chosen}
