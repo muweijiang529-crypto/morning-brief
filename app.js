@@ -100,7 +100,10 @@ async function gemini(prompt, json = true) {
 
 /* Quick translation: no key and no AI quota. AI is kept for choosing stories and explaining words. */
 async function gtOne(t) {
-  const r = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=${encodeURIComponent(t)}`);
+  let r;
+  try { r = await timed(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=${encodeURIComponent(t)}`, 10000); }
+  catch { throw new ApiError('连不上翻译服务，或者等太久了。'); }
+  if (r.status === 429) throw new ApiError('翻译服务暂时限流，过一会儿再试。', 429);
   if (!r.ok) throw new ApiError(`翻译服务返回错误（${r.status}）。`);
   return (await r.json())[0].map(x => x[0]).join('');
 }
@@ -115,8 +118,7 @@ async function translate(text) {
   if (rest) parts.push(rest);
   const out = [];
   for (const p of parts) {
-    try { out.push(await gtOne(p)); }
-    catch { out.push(await gemini(`把这段英文新闻翻译成简体中文，只输出译文：\n${p}`, false)); }
+    out.push(await gtOne(p));
   }
   return out.join('');
 }
@@ -245,18 +247,6 @@ function renderBrief() {
   bindItems($('#brief-list'));
   const used = new Set(b.items.map(a => a.url));
   startEndless((store.feeds?.items || []).filter(a => !used.has(a.url)), $('#more-list'));
-  prefetch(b.items);
-}
-
-/* Prepare the bilingual text of the morning stories while the app is open. */
-let prefetching = false;
-async function prefetch(items) {
-  if (prefetching) return;
-  prefetching = true;
-  try {
-    const list = items.filter(a => a.full).slice(0, 10);
-    await mapLimit(list, 2, async a => { try { const art = await articleData(a); await fillTranslation(art, `article:${a.id}`); } catch {} });
-  } finally { prefetching = false; }
 }
 
 /* ---------- pull to refresh ---------- */
@@ -348,14 +338,17 @@ function articleData(a) {
   artJobs.set(key, job);
   return job;
 }
-function fillTranslation(art, key, onPara) {
+function fillTranslation(art, key, onPara, onProgress) {
   const run = (async () => {
     let failed = 0, lastErr = '';
     const todo = art.en.map((t, i) => i).filter(i => !art.zh[i]);
-    await mapLimit(todo, 4, async i => {
+    let done = 0;
+    await mapLimit(todo, 3, async i => {
       if (art.zh[i]) return;
       try { art.zh[i] = await translate(art.en[i]); onPara?.(i, art.zh[i]); }
       catch (e) { failed++; lastErr = e.message; }
+      onProgress?.(++done, todo.length);
+      if (done % 5 === 0) idb.set(key, art);
     });
     if (todo.length) await idb.set(key, art);
     return {failed, lastErr};
@@ -384,7 +377,12 @@ function setZh(i, text) {
   if (el) { el.textContent = text; el.classList.remove('wait'); }
 }
 async function translateRest(a, art, key, body) {
-  const {failed, lastErr} = await fillTranslation(art, key, (i, z) => { if (body.isConnected) setZh(i, z); });
+  const bar = document.createElement('p');
+  bar.className = 'tr-progress';
+  if (art.zh.some(z => !z)) body.prepend(bar);
+  const {failed, lastErr} = await fillTranslation(art, key, (i, z) => { if (body.isConnected) setZh(i, z); },
+    (n, all) => { bar.textContent = `正在翻译 ${n}/${all} 段`; });
+  bar.remove();
   if (failed && body.isConnected) {
     view.querySelectorAll('.zh.wait').forEach(el => el.textContent = '');
     const box = document.createElement('div');
